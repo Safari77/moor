@@ -16,12 +16,17 @@ import (
 // BenchmarkHighlightedSearch and BenchmarkPlainTextSearch. The optimization has
 // been done to improve the sum of these two benchmarks.
 //
-//	200:    98+189=287
-//	1000:  106+188=294
-//	2000:  116+204=320 <-- best
-//	5000:  115+189=304
-//	10000:  91+151=242
-const searchLineCacheSize = 2_000
+// After introducing the RWMutex in reader.go these numbers became quite
+// volatile, they change a bunch from run to run so it's hard to draw obvious
+// conclusions. I ended up just picking one number.
+//
+//	 200: 387+368=755
+//	1000: 400+392=792
+//	2000: 382+394=776
+//	3000: 373+402=775
+//	4000: 393+412=805
+//	5000: 374+366=740
+const searchLineCacheSize = 500
 
 type searchLineCache struct {
 	lines []reader.NumberedLine
