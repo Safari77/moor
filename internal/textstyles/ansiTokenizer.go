@@ -54,20 +54,16 @@ func isPlain(s string) bool {
 }
 
 // lineIndex is only used for error reporting
-func WithoutFormatting(s string, lineIndex *linemetadata.Index) string {
+func StripFormatting(s string, lineIndex linemetadata.Index) string {
 	if isPlain(s) {
 		return s
 	}
 
 	stripped := strings.Builder{}
+	stripped.Grow(len(s)) // This makes BenchmarkStripFormatting 6% faster
 	runeCount := 0
 
-	// " * 2" here makes BenchmarkPlainTextSearch() perform 30% faster. Probably
-	// due to avoiding a number of additional implicit Grow() calls when adding
-	// runes.
-	stripped.Grow(len(s) * 2)
-
-	styledStringsFromString(twin.StyleDefault, s, lineIndex, func(str string, style twin.Style) {
+	styledStringsFromString(twin.StyleDefault, s, &lineIndex, func(str string, style twin.Style) {
 		for _, runeValue := range runesFromStyledString(_StyledString{String: str, Style: style}) {
 			switch runeValue {
 

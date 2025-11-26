@@ -68,6 +68,11 @@ type Reader interface {
 	ShouldShowLineCount() bool
 }
 
+type line struct {
+	raw            string
+	plainTextCache *string // Use line.Plain() to access this field
+}
+
 // ReaderImpl reads a file into an array of strings.
 //
 // It does the reading in the background, and it returns parts of the read data
@@ -77,7 +82,7 @@ type Reader interface {
 type ReaderImpl struct {
 	sync.RWMutex
 
-	lines []*Line
+	lines []*line
 
 	// Display name for the buffer. If not set, no buffer name will be shown.
 	//
@@ -123,6 +128,9 @@ type ReaderImpl struct {
 
 	// PauseStatus is true if the reader is paused, false if it is not
 	PauseStatus *atomic.Bool
+
+	// For benchmarking cold cache searches
+	disableCache bool
 }
 
 // InputLines contains a number of lines from the reader, plus metadata
@@ -164,7 +172,7 @@ func (reader *ReaderImpl) preAllocLines() {
 	}
 
 	// We had no lines since before, this is the expected happy path.
-	reader.lines = make([]*Line, 0, lineCount)
+	reader.lines = make([]*line, 0, lineCount)
 }
 
 // This is the reader's main function. It will be run in a goroutine. First it
@@ -277,13 +285,13 @@ func (reader *ReaderImpl) consumeLinesFromStream(stream io.Reader) {
 		}
 
 		newLineString := string(completeLine)
-		newLine := NewLine(newLineString)
+		newLine := line{raw: newLineString}
 
 		reader.Lock()
 		if len(reader.lines) > 0 && !reader.endsWithNewline {
 			// The last line didn't end with a newline, append to it
 			newLineString = reader.lines[len(reader.lines)-1].raw + newLineString
-			newLine = NewLine(newLineString)
+			newLine = line{raw: newLineString}
 			reader.lines[len(reader.lines)-1] = &newLine
 		} else {
 			reader.lines = append(reader.lines, &newLine)
@@ -497,10 +505,10 @@ func newReaderFromStream(reader io.Reader, originalFileName *string, formatter c
 // asynchronous ops will be performed.
 func NewFromTextForTesting(name string, text string) *ReaderImpl {
 	noExternalNewlines := strings.Trim(text, "\n")
-	lines := []*Line{}
+	lines := []*line{}
 	if len(noExternalNewlines) > 0 {
 		for _, lineString := range strings.Split(noExternalNewlines, "\n") {
-			line := NewLine(lineString)
+			line := line{raw: lineString}
 			lines = append(lines, &line)
 		}
 	}
@@ -519,6 +527,12 @@ func NewFromTextForTesting(name string, text string) *ReaderImpl {
 	}
 
 	return returnMe
+}
+
+func (reader *ReaderImpl) DisableCacheForBenchmarking() {
+	reader.Lock()
+	defer reader.Unlock()
+	reader.disableCache = true
 }
 
 // Duplicate of moor/moor.go:TryOpen
@@ -835,38 +849,90 @@ func (reader *ReaderImpl) ShouldShowLineCount() bool {
 	return false
 }
 
+// The reader must be RLock()ed before entering this function. The index is for
+// error reporting.
+func (reader *ReaderImpl) plain(lines []*line, firstIndex linemetadata.Index, withCache bool) []string {
+	alreadyCached := true
+	for _, l := range lines {
+		if l.plainTextCache == nil {
+			alreadyCached = false
+			break
+		}
+	}
+
+	if alreadyCached {
+		// All lines cached, fast path
+		plainLines := make([]string, 0, len(lines))
+		for _, l := range lines {
+			plainLines = append(plainLines, *l.plainTextCache)
+		}
+		return plainLines
+	}
+
+	// Plaining is slow, release the lock while doing it
+	reader.RUnlock()
+
+	// Holding no locks, do the slow work
+	plainLines := make([]string, 0, len(lines))
+	for loopIndex, l := range lines {
+		plainLines = append(plainLines, textstyles.StripFormatting(l.raw, firstIndex.NonWrappingAdd(loopIndex)))
+	}
+
+	// Update the reader, needs the write lock. Note that we take the lock
+	// whether or not we are actually caching, to simulate cache misses for
+	// benchmarking.
+	reader.Lock()
+	if withCache {
+		for loopIndex, l := range lines {
+			l.plainTextCache = &plainLines[loopIndex]
+		}
+	}
+	reader.Unlock()
+
+	// Reacquire the read lock for the next loop iteration
+	reader.RLock()
+
+	return plainLines
+}
+
 // GetLine gets a line. If the requested line number is out of bounds, nil is returned.
 func (reader *ReaderImpl) GetLine(index linemetadata.Index) *NumberedLine {
-	reader.Lock()
-	defer reader.Unlock()
+	reader.RLock()
+	defer reader.RUnlock()
 
 	if index.Index() >= reader.pauseAfterLines-DEFAULT_PAUSE_AFTER_LINES/2 {
+		// Switch to the write lock for changing the pause threshold
+		reader.RUnlock()
+		reader.Lock()
+
 		// Getting close(ish) to the pause threshold, bump it up. The Max()
 		// construct is to handle the case when the add overflows.
 		reader.pauseAfterLines = slices.Max([]int{
 			reader.pauseAfterLines + DEFAULT_PAUSE_AFTER_LINES/2,
 			reader.pauseAfterLines})
+
 		select {
 		case reader.pauseAfterLinesUpdated <- true:
 		default:
 			// Default case required for the write to be non-blocking
 		}
+
+		// Back to read lock for the rest of this function
+		reader.Unlock()
+		reader.RLock()
 	}
 
 	if !index.IsWithinLength(len(reader.lines)) {
 		return nil
 	}
 
-	line := reader.lines[index.Index()]
-	if line.plain == nil {
-		plain := textstyles.WithoutFormatting(line.raw, &index)
-		line.plain = &plain
-	}
+	returnLine := reader.lines[index.Index()]
+	plainReturnLines := reader.plain([]*line{returnLine}, index, !reader.disableCache)
 
 	return &NumberedLine{
 		Index:  index,
 		Number: linemetadata.NumberFromZeroBased(index.Index()),
-		Line:   line,
+		Line:   Line{raw: returnLine.raw, plain: plainReturnLines[0]},
 	}
 }
 
@@ -901,31 +967,17 @@ func (reader *ReaderImpl) getLinesUnlocked(firstLine linemetadata.Index, wantedL
 		return reader.getLinesUnlocked(firstLine, firstLine.CountLinesTo(lastLine))
 	}
 
-	notNumberedReturnLines := reader.lines[firstLine.Index() : lastLine.Index()+1]
-	returnLines := make([]NumberedLine, 0, len(notNumberedReturnLines))
-	for loopIndex, line := range notNumberedReturnLines {
+	rawReturnLines := reader.lines[firstLine.Index() : lastLine.Index()+1]
+	plainReturnLines := reader.plain(rawReturnLines, firstLine, !reader.disableCache)
+	returnLines := make([]NumberedLine, 0, len(rawReturnLines))
+	for loopIndex := range rawReturnLines {
 		lineIndex := firstLine.NonWrappingAdd(loopIndex)
 		returnLine := reader.lines[lineIndex.Index()]
-		if line.plain == nil {
-			// Plaining is slow, release the lock while doing it
-			reader.RUnlock()
-
-			// Holding no locks, do the slow work
-			plain := textstyles.WithoutFormatting(line.raw, &lineIndex)
-
-			// Update the reader, needs the write lock
-			reader.Lock()
-			line.plain = &plain
-			reader.Unlock()
-
-			// Reacquire the read lock for the next loop iteration
-			reader.RLock()
-		}
 
 		returnLines = append(returnLines, NumberedLine{
 			Index:  lineIndex,
 			Number: linemetadata.NumberFromZeroBased(lineIndex.Index()),
-			Line:   returnLine,
+			Line:   Line{raw: returnLine.raw, plain: plainReturnLines[loopIndex]},
 		})
 	}
 
@@ -987,9 +1039,9 @@ func (reader *ReaderImpl) PumpToStdout() {
 // Replace reader contents with the given text. Consider setting
 // HighlightingDone and signalling the MaybeDone channel afterwards.
 func (reader *ReaderImpl) setText(text string) {
-	lines := []*Line{}
+	lines := []*line{}
 	for _, lineString := range strings.Split(text, "\n") {
-		line := NewLine(lineString)
+		line := line{raw: lineString}
 		lines = append(lines, &line)
 	}
 

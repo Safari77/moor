@@ -63,7 +63,7 @@ func rowToString(row []twin.StyledRune) string {
 	return strings.TrimRight(rowString, " ")
 }
 
-func benchmarkSearch(b *testing.B, highlighted bool) {
+func benchmarkSearch(b *testing.B, highlighted bool, warm bool) {
 	log.SetLevel(log.WarnLevel) // Stop info logs from polluting benchmark output
 
 	// Pick a go file so we get something with highlighting
@@ -98,21 +98,33 @@ func benchmarkSearch(b *testing.B, highlighted bool) {
 	}
 	testString := builder.String()
 
-	reader := reader.NewFromTextForTesting("hello", testString)
-	assert.NilError(b, reader.Wait())
+	benchMe := reader.NewFromTextForTesting("hello", testString)
+	assert.NilError(b, benchMe.Wait())
 
 	// The [] around the 't' is there to make sure it doesn't match, remember
 	// we're searching through this very file.
 	pattern := regexp.MustCompile("This won'[t] match anything")
 
+	if warm {
+		// Warm up any caches etc by doing one search before we start measuring
+		hit := FindFirstHit(benchMe, *pattern, linemetadata.Index{}, nil, SearchDirectionForward)
+		if hit != nil {
+			panic(fmt.Errorf("This test is meant to scan the whole file without finding anything"))
+		}
+	} else {
+		benchMe.DisableCacheForBenchmarking()
+	}
+
 	// I hope forcing a GC here will make numbers more predictable
 	runtime.GC()
+
+	b.SetBytes(int64(len(testString)))
 
 	b.ResetTimer()
 
 	for range b.N {
 		// This test will search through all the N copies we made of our file
-		hit := FindFirstHit(reader, *pattern, linemetadata.Index{}, nil, SearchDirectionForward)
+		hit := FindFirstHit(benchMe, *pattern, linemetadata.Index{}, nil, SearchDirectionForward)
 
 		if hit != nil {
 			panic(fmt.Errorf("This test is meant to scan the whole file without finding anything"))
@@ -120,18 +132,32 @@ func benchmarkSearch(b *testing.B, highlighted bool) {
 	}
 }
 
-// How long does it take to search a highlighted file for some regex?
+// How long does it take to search a highlighted file for some regex the first time?
 //
 // Run with: go test -run='^$' -bench=. . ./...
-func BenchmarkHighlightedSearch(b *testing.B) {
-	benchmarkSearch(b, true)
+func BenchmarkHighlightedColdSearch(b *testing.B) {
+	benchmarkSearch(b, true, false)
 }
 
-// How long does it take to search a plain text file for some regex?
+// How long does it take to search a plain text file for some regex the first time?
 //
 // Search performance was a problem for me when I had a 600MB file to search in.
 //
 // Run with: go test -run='^$' -bench=. . ./...
-func BenchmarkPlainTextSearch(b *testing.B) {
-	benchmarkSearch(b, false)
+func BenchmarkPlainTextColdSearch(b *testing.B) {
+	benchmarkSearch(b, false, false)
+}
+
+// How long does it take to search a highlighted file for some regex the second time?
+//
+// Run with: go test -run='^$' -bench=. . ./...
+func BenchmarkHighlightedWarmSearch(b *testing.B) {
+	benchmarkSearch(b, true, true)
+}
+
+// How long does it take to search a plain text file for some regex the second time?
+//
+// Run with: go test -run='^$' -bench=. . ./...
+func BenchmarkPlainTextWarmSearch(b *testing.B) {
+	benchmarkSearch(b, false, true)
 }
