@@ -53,7 +53,7 @@ func (f *FilteringReader) rebuildCache() {
 	allBaseLines := f.BackingReader.GetLines(linemetadata.Index{}, math.MaxInt)
 	resultIndex := 0
 	for _, line := range allBaseLines.Lines {
-		if filterPattern != nil && len(filterPattern.String()) > 0 && !filterPattern.MatchString(line.Line.Plain()) {
+		if filterPattern != nil && len(filterPattern.String()) > 0 && !filterPattern.MatchString(line.Line.Plain(line.Index)) {
 			// We have a pattern but it doesn't match
 			continue
 		}
@@ -172,6 +172,16 @@ func (f *FilteringReader) GetLines(firstLine linemetadata.Index, wantedLineCount
 		Lines:      acceptedLines[firstLine.Index() : firstLine.Index()+wantedLineCount],
 		StatusText: f.createStatus(&lastLine),
 	}
+}
+
+func (f *FilteringReader) GetLinesPreallocated(firstLine linemetadata.Index, resultLines *[]reader.NumberedLine) string {
+	if f.shouldPassThrough() {
+		return f.BackingReader.GetLinesPreallocated(firstLine, resultLines)
+	}
+
+	lines := f.GetLines(firstLine, cap(*resultLines))
+	*resultLines = lines.Lines
+	return lines.StatusText
 }
 
 // In the general case, this will return a text like this:

@@ -80,7 +80,6 @@ func benchmarkSearch(b *testing.B, highlighted bool, warm bool) {
 	// to get the same amount of text in either case
 	replications := 5_000_000 / len(fileContents)
 
-	// Read one copy of the example input
 	if highlighted {
 		highlightedSourceCode, err := reader.Highlight(fileContents, *styles.Get("native"), formatters.TTY16m, lexers.Get("go"))
 		assert.NilError(b, err)
@@ -88,6 +87,12 @@ func benchmarkSearch(b *testing.B, highlighted bool, warm bool) {
 			panic("Highlighting didn't want to, returned nil")
 		}
 		fileContents = *highlightedSourceCode
+	}
+
+	if !warm {
+		// This makes the ns/op benchmark numbers more comparable between plain
+		// and highlighted in the cold case.
+		replications = 5_000_000 / len(fileContents)
 	}
 
 	// Create some input to search. Use a Builder to avoid quadratic string concatenation time.
@@ -105,25 +110,19 @@ func benchmarkSearch(b *testing.B, highlighted bool, warm bool) {
 	// we're searching through this very file.
 	pattern := regexp.MustCompile("This won'[t] match anything")
 
+	reader.DisablePlainCachingForBenchmarking = !warm
 	if warm {
 		// Warm up any caches etc by doing one search before we start measuring
 		hit := FindFirstHit(benchMe, *pattern, linemetadata.Index{}, nil, SearchDirectionForward)
 		if hit != nil {
 			panic(fmt.Errorf("This test is meant to scan the whole file without finding anything"))
 		}
-	} else {
-		benchMe.DisableCacheForBenchmarking()
 	}
 
 	// I hope forcing a GC here will make numbers more predictable
 	runtime.GC()
 
 	b.SetBytes(int64(len(testString)))
-	if !highlighted && !warm {
-		// Only report bytes per op for cold plain text searches, the others
-		// involve highlighting or caching which makes this number less relevant
-		b.SetBytes(int64(len(testString)))
-	}
 
 	b.ResetTimer()
 
