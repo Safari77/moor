@@ -141,6 +141,14 @@ func (s *styledStringSplitter) handleEscape() error {
 		return s.consumeG0Charset()
 	}
 
+	if char == '=' || char == '>' {
+		// Set keypad mode: ESC= switches to application mode (keypad sends
+		// escape sequences), ESC> switches to numeric mode (keypad sends ASCII
+		// characters). These are terminal control commands that don't affect
+		// text rendering, ignore them silently.
+		return nil
+	}
+
 	return fmt.Errorf("Unhandled Fe sequence ESC%c", char)
 }
 
@@ -210,6 +218,19 @@ func (s *styledStringSplitter) handleCompleteControlSequence(sequence string) er
 		return nil
 	}
 
+	if lastChar == 'h' || lastChar == 'l' {
+		// Mode setting (set or reset), e.g. ESC[?1049h (alt screen buffer)
+		// or ESC[4l (reset line wrapping). These are terminal control commands
+		// that don't affect text rendering, so we silently ignore them.
+		return nil
+	}
+
+	if lastChar == 'r' {
+		// Set scroll region, e.g. ESC[1;24r. This is a terminal control command
+		// that doesn't affect text rendering.
+		return nil
+	}
+
 	return fmt.Errorf("Unhandled CSI type %q", lastChar)
 }
 
@@ -245,10 +266,46 @@ func (s *styledStringSplitter) consumeOsc() error {
 			return fmt.Errorf("Expected OSC sequence to end with BEL or ESC \\ but got ESC %q", afterEsc)
 		}
 
-		if s.input[startIndex:s.nextByteIndex] == "8;;" {
-			// Special case, here comes an URL
+		if s.input[startIndex:s.nextByteIndex] == "8;" {
+			return s.handleOSC8()
+		}
+	}
+}
+
+// We just got ESC]8; and should now read the OSC 8 parameter field up to the
+// next semicolon. We currently ignore all parameters and then read the URL.
+func (s *styledStringSplitter) handleOSC8() error {
+	for {
+		char := s.nextChar()
+		if char == -1 {
+			return fmt.Errorf("Line ended in the middle of an OSC 8 parameter sequence")
+		}
+
+		if char == ';' {
+			// Found end of parameters, now read the URL
 			return s.handleURL()
 		}
+
+		if char == '\a' {
+			return fmt.Errorf("OSC 8 sequence ended before URL")
+		}
+
+		if char != esc {
+			continue
+		}
+
+		// Found ESC, check if it's followed by '\' to end the sequence, or something else which is an error
+
+		afterEsc := s.nextChar()
+		if afterEsc == -1 {
+			return fmt.Errorf("Line ended while ending an OSC 8 parameter sequence")
+		}
+
+		if afterEsc == '\\' {
+			return fmt.Errorf("OSC 8 sequence ended before URL")
+		}
+
+		return fmt.Errorf("Expected OSC 8 parameters to end with ';' but got ESC %q", afterEsc)
 	}
 }
 
