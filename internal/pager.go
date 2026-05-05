@@ -150,6 +150,7 @@ Miscellaneous
 * Press '=' to toggle showing the status bar at the bottom
 * Press 'v' to edit the file in your favorite editor
 * Press CTRL-t to change the tab size
+* Press 'r' to reload the current file
 
 Moving around
 -------------
@@ -250,10 +251,16 @@ func NewPager(readers ...*reader.ReaderImpl) *Pager {
 	return &pager
 }
 
+// ScreenSize returns the terminal width in columns and height in screen lines.
+func (p *Pager) ScreenSize() (int, linemetadata.ScreenLines) {
+	width, height := p.screen.Size()
+	return width, linemetadata.ScreenLines(height)
+}
+
 // How many lines are visible on screen? Depends on screen height and whether or
 // not the status bar is visible.
-func (p *Pager) visibleHeight() int {
-	_, height := p.screen.Size()
+func (p *Pager) visibleHeight() linemetadata.ScreenLines {
+	_, height := p.ScreenSize()
 
 	// Only the viewing mode can be without status bar
 	hasStatusBar := p.ShowStatusBar || !p.isViewing()
@@ -400,6 +407,42 @@ func (p *Pager) Reader() reader.Reader {
 		return _HelpReader
 	}
 	return &p.filteringReader
+}
+
+func (p *Pager) ReloadCurrentReader() {
+	p.readerLock.Lock()
+	defer p.readerLock.Unlock()
+
+	current := p.readers[p.currentReader]
+	if !current.ReadingDone.Load() || !current.HighlightingDone.Load() {
+		// The reader's formatting options (like the Style) are fully populated only
+		// once the initial read/highlighting pass consumes them from its channels.
+		// If we clone the reader before this happens, we copy a nil style, and the
+		// cloned reader will deadlock forever waiting for a style it will never receive.
+		//
+		// So let's just ignore this request. This should clear up quickly, and
+		// if the user presses 'r' again the reload will go through.
+		return
+	}
+
+	clone, err := current.Clone()
+	if err != nil {
+		log.Warnf("Failed to clone reader for reloading: %v", err)
+		return
+	}
+	if clone == nil {
+		// Nil indicates it's a stream or couldn't be cloned
+		return
+	}
+
+	current.Close()
+	p.readers[p.currentReader] = clone
+	p.filteringReader.SetBackingReader(clone)
+
+	select {
+	case p.readerSwitched <- struct{}{}:
+	default:
+	}
 }
 
 func (p *Pager) handleScrolledUp() {
